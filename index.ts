@@ -1,10 +1,11 @@
 // ==========================================
-// DeepInfra Proxy - Secure Whitelist CORS
+// DeepInfra Proxy - Text Models Only (Cleaned)
 // ==========================================
 
 interface ChatCompletionRequest {
     model: string;
     stream?: boolean;
+    messages?: any[];
     [key: string]: any;
 }
 
@@ -13,13 +14,31 @@ const CONFIG = {
     port: parseInt(process.env.PORT || '12506'),
     apiKey: process.env.API_KEY || 'default-key-change-me',
     upstreamUrl: "https://api.deepinfra.com/v1/openai",
-    // Lấy danh sách allowed origins từ biến môi trường, tách bằng dấu phẩy
-    // Ví dụ: ALLOWED_ORIGINS="https://airi.moeru.ai,https://my-app.com"
-    // Mặc định là "*" (cho phép tất cả) nếu không set biến này.
     allowedOrigins: process.env.ALLOWED_ORIGINS 
         ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()) 
         : ['*'] 
 };
+
+// --- Filter Config: Các từ khóa cần loại bỏ ---
+// Những model chứa từ này trong ID sẽ bị ẩn khỏi danh sách
+const MODEL_BLACKLIST = [
+    "flux",             // Tạo ảnh
+    "sdxl",             // Tạo ảnh
+    "stable-diffusion", // Tạo ảnh
+    "bria",             // Xử lý ảnh (remove bg)
+    "clip",             // Embedding/Vision
+    "embedding",        // Vector Embedding (không chat được)
+    "text2vec",         // Embedding
+    "bert",             // Embedding
+    "gte-",             // Embedding
+    "e5-",              // Embedding
+    "fibo",             // Image tools
+    "remove_background",
+    "erase_foreground",
+    "gen_fill",
+    "tts",              // Audio
+    "whisper"           // Audio
+];
 
 // --- Logger ---
 function log(level: string, message: string) {
@@ -27,7 +46,6 @@ function log(level: string, message: string) {
 }
 
 // --- Dynamic CORS Handler ---
-// Hàm này sẽ quyết định xem request có được phép hay không
 function getCorsHeaders(requestOrigin: string | null): Headers {
     const headers = new Headers({
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
@@ -35,21 +53,14 @@ function getCorsHeaders(requestOrigin: string | null): Headers {
         "Access-Control-Max-Age": "86400",
     });
 
-    // Logic kiểm tra Whitelist
     if (!requestOrigin) {
-        // Nếu không có Origin (ví dụ gọi từ curl, server-side), ta có thể cho phép hoặc chặn.
-        // Để debug dễ, tạm thời cho phép. Nếu muốn strict thì xóa dòng dưới.
         headers.set("Access-Control-Allow-Origin", "*");
     } else {
-        // Nếu cấu hình cho phép tất cả ('*') hoặc Origin nằm trong danh sách cho phép
         if (CONFIG.allowedOrigins.includes('*') || CONFIG.allowedOrigins.includes(requestOrigin)) {
             headers.set("Access-Control-Allow-Origin", requestOrigin);
-            headers.set("Vary", "Origin"); // Báo cho Cache biết response này phụ thuộc vào Origin
+            headers.set("Vary", "Origin");
         }
-        // LƯU Ý: Nếu không khớp, ta KHÔNG set header Access-Control-Allow-Origin.
-        // Trình duyệt sẽ tự động block request này.
     }
-
     return headers;
 }
 
@@ -79,25 +90,18 @@ const server = Bun.serve({
         const url = new URL(request.url);
         const origin = request.headers.get("Origin");
 
-        log("INFO", `[${request.method}] ${url.pathname} | Origin: ${origin || 'Direct/Curl'}`);
+        log("INFO", `[${request.method}] ${url.pathname} | Origin: ${origin || 'Direct'}`);
 
         // 1. PREFLIGHT (OPTIONS)
         if (request.method === "OPTIONS") {
-            // Kiểm tra Origin ngay từ bước OPTIONS
             const corsHeaders = getCorsHeaders(origin);
-            
-            // Nếu không có header Allow-Origin (do không khớp whitelist), trình duyệt sẽ fail ngay tại đây
             if (!corsHeaders.has("Access-Control-Allow-Origin")) {
-                return new Response(null, { status: 403 }); // Forbidden
+                return new Response(null, { status: 403 });
             }
-
-            return new Response(null, {
-                status: 204,
-                headers: corsHeaders
-            });
+            return new Response(null, { status: 204, headers: corsHeaders });
         }
 
-        // Helper response có kèm CORS động
+        // Helper response
         const jsonResponse = (data: any, status = 200) => {
             const headers = getCorsHeaders(origin);
             headers.set("Content-Type", "application/json");
@@ -106,16 +110,36 @@ const server = Bun.serve({
 
         // 2. Health Check
         if (request.method === "GET" && (url.pathname === "/v1/health" || url.pathname === "/health")) {
-            return jsonResponse({ status: "ok", secured: true });
+            return jsonResponse({ status: "ok", type: "text-models-only" });
         }
 
-        // 3. Get Models
+        // 3. Get Models (CÓ LỌC MODEL)
         if (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
             try {
                 const res = await fetch(`${CONFIG.upstreamUrl}/models`, {
                     headers: getUpstreamHeaders()
                 });
-                const data = await res.json();
+                
+                if (!res.ok) throw new Error("Upstream failed");
+                
+                const data = await res.json() as { object: string, data: any[] };
+                
+                // --- LOGIC LỌC MODEL ---
+                if (data.data && Array.isArray(data.data)) {
+                    const originalCount = data.data.length;
+                    
+                    // Chỉ giữ lại model KHÔNG chứa từ khóa trong Blacklist
+                    data.data = data.data.filter(model => {
+                        const modelId = model.id.toLowerCase();
+                        // Kiểm tra xem ID có chứa từ khóa cấm nào không
+                        const isBlacklisted = MODEL_BLACKLIST.some(keyword => modelId.includes(keyword));
+                        return !isBlacklisted;
+                    });
+
+                    log("INFO", `Filtered models: ${originalCount} -> ${data.data.length}`);
+                }
+                // -----------------------
+
                 return jsonResponse(data);
             } catch (e) {
                 return jsonResponse({ error: "Fetch error" }, 500);
@@ -132,6 +156,22 @@ const server = Bun.serve({
             try {
                 const body = await request.json() as ChatCompletionRequest;
                 
+                // Giữ lại logic Mocking phòng trường hợp Client cache model cũ
+                if (body.model && MODEL_BLACKLIST.some(kw => body.model.toLowerCase().includes(kw))) {
+                     log("WARN", `Blocked/Mocked request for non-text model: ${body.model}`);
+                     return jsonResponse({
+                        id: "chatcmpl-mock-blocked",
+                        object: "chat.completion",
+                        created: Date.now(),
+                        model: body.model,
+                        choices: [{
+                            index: 0,
+                            message: { role: "assistant", content: "[System] This model is not available for text chat." },
+                            finish_reason: "stop"
+                        }]
+                    });
+                }
+
                 const upstreamHeaders = getUpstreamHeaders();
                 if (body.stream) upstreamHeaders.set("Accept", "text/event-stream");
 
@@ -143,13 +183,8 @@ const server = Bun.serve({
 
                 // Xử lý Headers trả về
                 const responseHeaders = new Headers(upstreamRes.headers);
-                
-                // Áp dụng CORS whitelist của chúng ta (ghi đè header cũ của upstream)
                 const dynamicCors = getCorsHeaders(origin);
-                dynamicCors.forEach((value, key) => {
-                    responseHeaders.set(key, value);
-                });
-
+                dynamicCors.forEach((value, key) => responseHeaders.set(key, value));
                 responseHeaders.delete("content-encoding");
                 responseHeaders.delete("content-length");
 
@@ -159,7 +194,7 @@ const server = Bun.serve({
                 });
 
             } catch (error) {
-                return jsonResponse({ error: "Proxy Error" }, 500);
+                return jsonResponse({ error: "Internal Proxy Error" }, 500);
             }
         }
 
@@ -167,5 +202,5 @@ const server = Bun.serve({
     }
 });
 
-log("INFO", `Server running on port ${CONFIG.port}`);
-log("INFO", `Allowed Origins: ${CONFIG.allowedOrigins.join(", ")}`);
+log("INFO", `Proxy running on port ${CONFIG.port}`);
+log("INFO", `Filtering enabled for keywords: ${MODEL_BLACKLIST.join(", ")}`);
