@@ -30,17 +30,30 @@ interface DeepInfraModelsResponse {
 
 interface ChatCompletionRequest {
     model: string;
-    stream?: boolean; // Added for stream handling logic
-    [key: string]: any; // Allow additional properties
+    stream?: boolean; 
+    [key: string]: any; 
 }
 
-// Load configuration from environment variables
+// Load configuration
 const CONFIG = {
     port: parseInt(process.env.PORT || '12506'),
     apiKey: process.env.API_KEY || 'default-key-change-me',
-    // CORS_ORIGINS removed as requested
     upstreamUrl: "https://api.deepinfra.com/v1/openai"
 };
+
+// FILTER CONFIGURATION: Keywords to exclude non-text models
+// Removes: Image generators, Image editors, specialized OCR, and CLIP embeddings
+const EXCLUDED_MODEL_KEYWORDS = [
+    "stabilityai",       // SDXL / Stable Diffusion
+    "black-forest-labs", // FLUX models
+    "bria",              // Image editing tools
+    "seedream",          // ByteDance Image Gen
+    "image-edit",        // Qwen Image Edit
+    "clip-vit",          // CLIP (Image-Text embedding)
+    "ocr",               // OCR models (Image to Text)
+    "janus",             // Multimodal/Image Gen
+    "diffusion"          // Generic diffusion catch
+];
 
 // Simple logging function
 function log(level: 'INFO' | 'ERROR' | 'WARN', message: string, data?: any) {
@@ -58,16 +71,16 @@ let cachedSourceData: ModelData[] | null = null;
 let cacheTimestamp: number | null = null;
 const CACHE_TTL = 60 * 1000; // 1 minute cache
 
-// Aggressive CORS Headers to bypass restrictions
+// Aggressive CORS Headers
 const CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "*", // Allow all headers
+    "Access-Control-Allow-Headers": "*",
     "Access-Control-Expose-Headers": "*",
     "Access-Control-Max-Age": "86400",
 };
 
-// Common Headers Strategy to mimic browser behavior (avoid 403s)
+// Upstream Headers Strategy
 function getUpstreamHeaders(): Headers {
     return new Headers({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
@@ -86,7 +99,7 @@ function getUpstreamHeaders(): Headers {
     });
 }
 
-// Helper function to create JSON response with CORS headers
+// Helper: JSON Response with CORS
 function createJsonResponse<T>(data: T, status = 200) {
     return new Response(JSON.stringify(data), {
         status,
@@ -97,16 +110,14 @@ function createJsonResponse<T>(data: T, status = 200) {
     });
 }
 
-// Helper function to validate API key
+// Helper: API Key Validation
 function validateApiKey(authHeader: string): boolean {
-    if (!authHeader.startsWith('Bearer ')) {
-        return false;
-    }
+    if (!authHeader.startsWith('Bearer ')) return false;
     const token = authHeader.slice(7);
     return token === CONFIG.apiKey;
 }
 
-// Optimized function to fetch models from upstream
+// CORE: Fetch and FILTER models
 async function getModelsData(): Promise<ModelData[]> {
     const now = Date.now();
 
@@ -135,16 +146,23 @@ async function getModelsData(): Promise<ModelData[]> {
             throw new Error("Invalid response structure from upstream");
         }
 
+        // --- FILTERING LOGIC ---
+        // Keep only models that DO NOT match the excluded keywords
+        const filteredModels = data.data.filter(model => {
+            const id = model.id.toLowerCase();
+            return !EXCLUDED_MODEL_KEYWORDS.some(keyword => id.includes(keyword));
+        });
+
+        log('INFO', `Fetched ${data.data.length} models, filtered down to ${filteredModels.length} text/chat models.`);
+
         // Update cache
-        cachedSourceData = data.data;
+        cachedSourceData = filteredModels;
         cacheTimestamp = now;
         
-        log('INFO', `Successfully cached ${cachedSourceData.length} models.`);
         return cachedSourceData;
 
     } catch (error) {
         log('ERROR', 'Failed to fetch models from upstream', error);
-        // If fetch fails but we have old cache, return it as fallback
         if (cachedSourceData) {
             log('WARN', 'Serving stale cache due to fetch error');
             return cachedSourceData;
@@ -160,25 +178,22 @@ const server = Bun.serve({
         const url = new URL(request.url);
         const path = url.pathname;
 
-        // 1. Handle CORS preflight requests globally
+        // 1. Global CORS Preflight
         if (request.method === "OPTIONS") {
-            return new Response(null, {
-                status: 204,
-                headers: CORS_HEADERS
-            });
+            return new Response(null, { status: 204, headers: CORS_HEADERS });
         }
 
-        // 2. Health Check Endpoint
+        // 2. Health Check
         if (request.method === "GET" && path === "/health") {
             return createJsonResponse({
                 status: "ok",
-                service: "deepinfra-proxy",
+                service: "deepinfra-proxy-text-only",
                 uptime: process.uptime(),
                 timestamp: new Date().toISOString()
             });
         }
 
-        // 3. Models Endpoint (Moved to /v1)
+        // 3. Models Endpoint (/v1/models)
         if (request.method === "GET" && path === "/v1/models") {
             log('INFO', `Models list requested from ${request.headers.get('CF-Connecting-IP') || 'unknown'}`);
             try {
@@ -190,48 +205,27 @@ const server = Bun.serve({
             } catch (error) {
                 log('ERROR', 'Error serving models request', error);
                 return createJsonResponse({
-                    error: {
-                        message: "Failed to get models",
-                        type: "server_error",
-                        code: 500
-                    }
+                    error: { message: "Failed to get models", type: "server_error", code: 500 }
                 }, 500);
             }
         }
 
-        // 4. Chat Completions Endpoint (Moved to /v1)
+        // 4. Chat Completions Endpoint (/v1/chat/completions)
         if (request.method === "POST" && path === "/v1/chat/completions") {
-            // Validate Authorization header
             const authHeader = request.headers.get("Authorization");
             if (!authHeader) {
-                return createJsonResponse({
-                    error: {
-                        message: "Missing Authorization header",
-                        type: "authentication_error",
-                        code: 401
-                    }
-                }, 401);
+                return createJsonResponse({ error: { message: "Missing Authorization header", type: "authentication_error", code: 401 } }, 401);
             }
 
-            // Validate API key
             if (!validateApiKey(authHeader)) {
-                return createJsonResponse({
-                    error: {
-                        message: "Invalid API key",
-                        type: "authentication_error",
-                        code: 401
-                    }
-                }, 401);
+                return createJsonResponse({ error: { message: "Invalid API key", type: "authentication_error", code: 401 } }, 401);
             }
 
             try {
                 const body = await request.json() as ChatCompletionRequest;
                 log('INFO', `Chat completion request for model: ${body.model}`);
 
-                // Prepare upstream headers
                 const headers = getUpstreamHeaders();
-                
-                // Adjust Accept header for streaming if requested
                 if (body.stream) {
                     headers.set("Accept", "text/event-stream");
                 }
@@ -244,16 +238,10 @@ const server = Bun.serve({
 
                 log('INFO', `DeepInfra response status: ${response.status}`);
 
-                // Proxy response with CORS injection
-                // We use Object.fromEntries to copy upstream headers (Content-Type, etc)
-                // Then overwrite with our CORS headers
                 const responseHeaders = new Headers(response.headers);
-                
-                // Explicitly remove content-encoding to let Bun/Client handle it locally
                 responseHeaders.delete("content-encoding");
-                responseHeaders.delete("content-length"); // Let server recalculate
-
-                // Inject CORS headers
+                responseHeaders.delete("content-length");
+                
                 Object.entries(CORS_HEADERS).forEach(([key, value]) => {
                     responseHeaders.set(key, value);
                 });
@@ -267,18 +255,14 @@ const server = Bun.serve({
             } catch (error) {
                 log('ERROR', 'Error in chat completion', error);
                 return createJsonResponse({
-                    error: {
-                        message: (error as Error).message,
-                        type: "server_error",
-                        code: 500
-                    }
+                    error: { message: (error as Error).message, type: "server_error", code: 500 }
                 }, 500);
             }
         }
 
-        // 5. Default Route / 404
+        // 5. Fallback / Root
         if (path === "/") {
-            return new Response("DeepInfra Proxy Active (v1)", {
+            return new Response("DeepInfra Proxy Active (Text Models Only)", {
                 headers: { "Content-Type": "text/plain", ...CORS_HEADERS }
             });
         }
