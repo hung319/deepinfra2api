@@ -30,6 +30,7 @@ interface DeepInfraModelsResponse {
 
 interface ChatCompletionRequest {
     model: string;
+    stream?: boolean; // Added for stream handling logic
     [key: string]: any; // Allow additional properties
 }
 
@@ -37,7 +38,7 @@ interface ChatCompletionRequest {
 const CONFIG = {
     port: parseInt(process.env.PORT || '12506'),
     apiKey: process.env.API_KEY || 'default-key-change-me',
-    corsOrigins: process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : ['*'],
+    // CORS_ORIGINS removed as requested
     upstreamUrl: "https://api.deepinfra.com/v1/openai"
 };
 
@@ -57,11 +58,12 @@ let cachedSourceData: ModelData[] | null = null;
 let cacheTimestamp: number | null = null;
 const CACHE_TTL = 60 * 1000; // 1 minute cache
 
-// Simplified CORS headers
+// Aggressive CORS Headers to bypass restrictions
 const CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "*", // Allow all headers
+    "Access-Control-Expose-Headers": "*",
     "Access-Control-Max-Age": "86400",
 };
 
@@ -69,7 +71,7 @@ const CORS_HEADERS = {
 function getUpstreamHeaders(): Headers {
     return new Headers({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
-        "Accept": "application/json", // Changed for general usage
+        "Accept": "application/json",
         "Accept-Encoding": "gzip, deflate, br, zstd",
         "Content-Type": "application/json",
         "sec-ch-ua-platform": "Windows",
@@ -156,16 +158,28 @@ const server = Bun.serve({
     port: CONFIG.port,
     async fetch(request: Request) {
         const url = new URL(request.url);
+        const path = url.pathname;
 
-        // Handle CORS preflight requests
+        // 1. Handle CORS preflight requests globally
         if (request.method === "OPTIONS") {
-            return createJsonResponse(null, 204);
+            return new Response(null, {
+                status: 204,
+                headers: CORS_HEADERS
+            });
         }
 
-        // Handle GET requests for models list
-        if (request.method === "GET" && url.pathname === "/models") {
-            // Optional: Add API Key validation for models endpoint if desired, 
-            // currently public as per original code logic.
+        // 2. Health Check Endpoint
+        if (request.method === "GET" && path === "/health") {
+            return createJsonResponse({
+                status: "ok",
+                service: "deepinfra-proxy",
+                uptime: process.uptime(),
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        // 3. Models Endpoint (Moved to /v1)
+        if (request.method === "GET" && path === "/v1/models") {
             log('INFO', `Models list requested from ${request.headers.get('CF-Connecting-IP') || 'unknown'}`);
             try {
                 const modelsData = await getModelsData();
@@ -185,79 +199,97 @@ const server = Bun.serve({
             }
         }
 
-        // Handle POST requests for chat completions
-        if (request.method !== "POST" || url.pathname !== "/chat/completions") {
-            // Allow simple root check or 404 others
-            if (url.pathname === "/") return new Response("DeepInfra Proxy Active");
-            
-            return createJsonResponse({
-                error: {
-                    message: "Method not allowed",
-                    type: "invalid_request_error",
-                    code: 405
+        // 4. Chat Completions Endpoint (Moved to /v1)
+        if (request.method === "POST" && path === "/v1/chat/completions") {
+            // Validate Authorization header
+            const authHeader = request.headers.get("Authorization");
+            if (!authHeader) {
+                return createJsonResponse({
+                    error: {
+                        message: "Missing Authorization header",
+                        type: "authentication_error",
+                        code: 401
+                    }
+                }, 401);
+            }
+
+            // Validate API key
+            if (!validateApiKey(authHeader)) {
+                return createJsonResponse({
+                    error: {
+                        message: "Invalid API key",
+                        type: "authentication_error",
+                        code: 401
+                    }
+                }, 401);
+            }
+
+            try {
+                const body = await request.json() as ChatCompletionRequest;
+                log('INFO', `Chat completion request for model: ${body.model}`);
+
+                // Prepare upstream headers
+                const headers = getUpstreamHeaders();
+                
+                // Adjust Accept header for streaming if requested
+                if (body.stream) {
+                    headers.set("Accept", "text/event-stream");
                 }
-            }, 405);
+
+                const response = await fetch(`${CONFIG.upstreamUrl}/chat/completions`, {
+                    method: "POST",
+                    headers: headers,
+                    body: JSON.stringify(body)
+                });
+
+                log('INFO', `DeepInfra response status: ${response.status}`);
+
+                // Proxy response with CORS injection
+                // We use Object.fromEntries to copy upstream headers (Content-Type, etc)
+                // Then overwrite with our CORS headers
+                const responseHeaders = new Headers(response.headers);
+                
+                // Explicitly remove content-encoding to let Bun/Client handle it locally
+                responseHeaders.delete("content-encoding");
+                responseHeaders.delete("content-length"); // Let server recalculate
+
+                // Inject CORS headers
+                Object.entries(CORS_HEADERS).forEach(([key, value]) => {
+                    responseHeaders.set(key, value);
+                });
+
+                return new Response(response.body, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: responseHeaders
+                });
+
+            } catch (error) {
+                log('ERROR', 'Error in chat completion', error);
+                return createJsonResponse({
+                    error: {
+                        message: (error as Error).message,
+                        type: "server_error",
+                        code: 500
+                    }
+                }, 500);
+            }
         }
 
-        // Validate Authorization header
-        const authHeader = request.headers.get("Authorization");
-        if (!authHeader) {
-            return createJsonResponse({
-                error: {
-                    message: "Missing Authorization header",
-                    type: "authentication_error",
-                    code: 401
-                }
-            }, 401);
-        }
-
-        // Validate API key
-        if (!validateApiKey(authHeader)) {
-            return createJsonResponse({
-                error: {
-                    message: "Invalid API key",
-                    type: "authentication_error",
-                    code: 401
-                }
-            }, 401);
-        }
-
-        try {
-            const body = await request.json() as ChatCompletionRequest;
-            log('INFO', `Chat completion request for model: ${body.model}`);
-
-            // Use centralized headers generator, specific override for POST/Stream
-            const headers = getUpstreamHeaders();
-            headers.set("Accept", "text/event-stream"); // Specific for chat stream
-
-            const response = await fetch(`${CONFIG.upstreamUrl}/chat/completions`, {
-                method: "POST",
-                headers: headers,
-                body: JSON.stringify(body)
+        // 5. Default Route / 404
+        if (path === "/") {
+            return new Response("DeepInfra Proxy Active (v1)", {
+                headers: { "Content-Type": "text/plain", ...CORS_HEADERS }
             });
-
-            log('INFO', `DeepInfra response status: ${response.status}`);
-
-            // Construct response
-            return new Response(response.body, {
-                status: response.status,
-                statusText: response.statusText,
-                headers: {
-                    ...CORS_HEADERS,
-                    "Content-Type": response.headers.get("Content-Type") || "application/json",
-                }
-            });
-
-        } catch (error) {
-            log('ERROR', 'Error in chat completion', error);
-            return createJsonResponse({
-                error: {
-                    message: (error as Error).message,
-                    type: "server_error",
-                    code: 500
-                }
-            }, 500);
         }
+        
+        return createJsonResponse({
+            error: {
+                message: `Route ${path} not found. Available: /v1/models, /v1/chat/completions`,
+                type: "invalid_request_error",
+                code: 404
+            }
+        }, 404);
     },
 });
 
