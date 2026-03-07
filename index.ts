@@ -82,6 +82,11 @@ const CORS_HEADERS = {
 
 // Upstream Headers Strategy
 function getUpstreamHeaders(): Headers {
+    // Log a warning if using the default key
+    if (CONFIG.apiKey === 'default-key-change-me') {
+        log('ERROR', 'WARNING: Using default API key for upstream requests. This will result in 401 Unauthorized from DeepInfra API. Please set API_KEY environment variable with a valid DeepInfra API key.');
+    }
+    
     return new Headers({
         "Authorization": `Bearer ${CONFIG.apiKey}`,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
@@ -115,6 +120,13 @@ function createJsonResponse<T>(data: T, status = 200) {
 function validateApiKey(authHeader: string): boolean {
     if (!authHeader.startsWith('Bearer ')) return false;
     const token = authHeader.slice(7);
+    
+    // Check if using default key and log a warning
+    if (CONFIG.apiKey === 'default-key-change-me') {
+        log('ERROR', 'Using default API key - requests to upstream API will fail. Please set API_KEY environment variable with a valid DeepInfra API key.');
+        return token === CONFIG.apiKey; // This will pass validation but upstream will fail
+    }
+    
     return token === CONFIG.apiKey;
 }
 
