@@ -83,6 +83,7 @@ const CORS_HEADERS = {
 // Upstream Headers Strategy
 function getUpstreamHeaders(): Headers {
     return new Headers({
+        "Authorization": `Bearer ${CONFIG.apiKey}`,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
         "Accept": "application/json",
         "Accept-Encoding": "gzip, deflate, br, zstd",
