@@ -123,17 +123,36 @@ async function getModelsData(): Promise<ModelData[]> {
 
     // Return cached data if valid
     if (cachedSourceData && cacheTimestamp && (now - cacheTimestamp) < CACHE_TTL) {
+        log('INFO', 'Serving cached models data', {
+            cacheAgeMs: now - (cacheTimestamp || 0),
+            modelCount: cachedSourceData.length
+        });
         return cachedSourceData;
     }
 
-    log('INFO', 'Cache expired or empty, fetching models from DeepInfra...');
+    log('INFO', 'Cache expired or empty, fetching models from DeepInfra...', {
+        cacheTimestamp: cacheTimestamp,
+        cacheAge: cacheTimestamp ? (now - cacheTimestamp) : 'never cached',
+        TTL: CACHE_TTL
+    });
 
     try {
         const headers = getUpstreamHeaders();
         
+        log('INFO', 'Making request to upstream models endpoint', {
+            url: `${CONFIG.upstreamUrl}/models`,
+            headers: Object.fromEntries(headers.entries())
+        });
+        
         const response = await fetch(`${CONFIG.upstreamUrl}/models`, {
             method: "GET",
             headers: headers
+        });
+
+        log('INFO', 'Received response from upstream models endpoint', {
+            status: response.status,
+            statusText: response.statusText,
+            responseHeaders: Object.fromEntries(response.headers.entries())
         });
 
         if (!response.ok) {
@@ -141,6 +160,12 @@ async function getModelsData(): Promise<ModelData[]> {
         }
 
         const data = await response.json() as DeepInfraModelsResponse;
+        
+        log('INFO', 'Parsed upstream response', {
+            totalModels: data.data?.length || 0,
+            responseStructure: typeof data,
+            hasDataProperty: !!data.data
+        });
         
         if (!data.data || !Array.isArray(data.data)) {
             throw new Error("Invalid response structure from upstream");
@@ -150,10 +175,17 @@ async function getModelsData(): Promise<ModelData[]> {
         // Keep only models that DO NOT match the excluded keywords
         const filteredModels = data.data.filter(model => {
             const id = model.id.toLowerCase();
-            return !EXCLUDED_MODEL_KEYWORDS.some(keyword => id.includes(keyword));
+            const isExcluded = EXCLUDED_MODEL_KEYWORDS.some(keyword => id.includes(keyword));
+            if (isExcluded) {
+                log('INFO', `Filtered out model: ${model.id} (matched: ${EXCLUDED_MODEL_KEYWORDS.find(keyword => id.includes(keyword))})`);
+            }
+            return !isExcluded;
         });
 
-        log('INFO', `Fetched ${data.data.length} models, filtered down to ${filteredModels.length} text/chat models.`);
+        log('INFO', `Fetched ${data.data.length} models from upstream, filtered down to ${filteredModels.length} text/chat models.`, {
+            excludedCount: data.data.length - filteredModels.length,
+            filteredModels: filteredModels.map(m => m.id)
+        });
 
         // Update cache
         cachedSourceData = filteredModels;
@@ -162,9 +194,16 @@ async function getModelsData(): Promise<ModelData[]> {
         return cachedSourceData;
 
     } catch (error) {
-        log('ERROR', 'Failed to fetch models from upstream', error);
+        log('ERROR', 'Failed to fetch models from upstream', {
+            errorMessage: (error as Error).message,
+            errorStack: (error as Error).stack,
+            error: error
+        });
         if (cachedSourceData) {
-            log('WARN', 'Serving stale cache due to fetch error');
+            log('WARN', 'Serving stale cache due to fetch error', {
+                cachedModelCount: cachedSourceData.length,
+                cacheAge: (Date.now() - (cacheTimestamp || 0))
+            });
             return cachedSourceData;
         }
         throw error;
@@ -195,40 +234,80 @@ const server = Bun.serve({
 
         // 3. Models Endpoint (/v1/models)
         if (request.method === "GET" && path === "/v1/models") {
-            log('INFO', `Models list requested from ${request.headers.get('CF-Connecting-IP') || 'unknown'}`);
+            log('INFO', `Models list requested from IP: ${request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'unknown'}`, {
+                userAgent: request.headers.get('User-Agent'),
+                accept: request.headers.get('Accept')
+            });
             try {
                 const modelsData = await getModelsData();
+                log('INFO', `Serving models list`, {
+                    totalModels: modelsData.length,
+                    cacheHit: !!cachedSourceData && cacheTimestamp && (Date.now() - cacheTimestamp) < CACHE_TTL
+                });
+                
                 return createJsonResponse({
                     object: "list",
                     data: modelsData
                 });
             } catch (error) {
-                log('ERROR', 'Error serving models request', error);
+                log('ERROR', 'Error serving models request', {
+                    errorMessage: (error as Error).message,
+                    errorStack: (error as Error).stack,
+                    error: error
+                });
                 return createJsonResponse({
-                    error: { message: "Failed to get models", type: "server_error", code: 500 }
+                    error: { 
+                        message: "Failed to get models", 
+                        type: "server_error", 
+                        code: 500,
+                        details: process.env.NODE_ENV === 'development' ? (error as Error).stack : undefined
+                    }
                 }, 500);
             }
         }
 
         // 4. Chat Completions Endpoint (/v1/chat/completions)
         if (request.method === "POST" && path === "/v1/chat/completions") {
+            log('INFO', `Chat completion request received from IP: ${request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'unknown'}`, {
+                url: request.url,
+                userAgent: request.headers.get('User-Agent'),
+                contentType: request.headers.get('Content-Type'),
+                accept: request.headers.get('Accept')
+            });
+            
             const authHeader = request.headers.get("Authorization");
             if (!authHeader) {
+                log('ERROR', 'Missing Authorization header in chat request');
                 return createJsonResponse({ error: { message: "Missing Authorization header", type: "authentication_error", code: 401 } }, 401);
             }
 
             if (!validateApiKey(authHeader)) {
+                log('ERROR', 'Invalid API key provided in chat request');
                 return createJsonResponse({ error: { message: "Invalid API key", type: "authentication_error", code: 401 } }, 401);
             }
+            
+            log('INFO', `API key validation passed for chat request`);
 
             try {
                 const body = await request.json() as ChatCompletionRequest;
-                log('INFO', `Chat completion request for model: ${body.model}`);
+                log('INFO', `Chat completion request for model: ${body.model}`, {
+                    model: body.model,
+                    stream: body.stream,
+                    messages: body.messages ? `${body.messages.length} messages` : 'no messages',
+                    requestBodySize: JSON.stringify(body).length
+                });
 
                 const headers = getUpstreamHeaders();
                 if (body.stream) {
                     headers.set("Accept", "text/event-stream");
+                    log('INFO', 'Setting Accept header to text/event-stream for streaming response');
                 }
+                
+                log('INFO', `Making upstream request to: ${CONFIG.upstreamUrl}/chat/completions`, {
+                    method: "POST",
+                    body: JSON.stringify(body),
+                    headers: Object.fromEntries(headers.entries())
+                });
 
                 const response = await fetch(`${CONFIG.upstreamUrl}/chat/completions`, {
                     method: "POST",
@@ -236,7 +315,12 @@ const server = Bun.serve({
                     body: JSON.stringify(body)
                 });
 
-                log('INFO', `DeepInfra response status: ${response.status}`);
+                log('INFO', `Received upstream response`, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    responseHeaders: Object.fromEntries(response.headers.entries()),
+                    responseSize: response.headers.get('content-length') || 'chunked'
+                });
 
                 const responseHeaders = new Headers(response.headers);
                 responseHeaders.delete("content-encoding");
@@ -246,6 +330,11 @@ const server = Bun.serve({
                     responseHeaders.set(key, value);
                 });
 
+                log('INFO', `Sending response back to client with headers`, {
+                    responseStatus: response.status,
+                    finalHeaders: Object.fromEntries(responseHeaders.entries())
+                });
+
                 return new Response(response.body, {
                     status: response.status,
                     statusText: response.statusText,
@@ -253,9 +342,19 @@ const server = Bun.serve({
                 });
 
             } catch (error) {
-                log('ERROR', 'Error in chat completion', error);
+                log('ERROR', 'Error in chat completion', {
+                    errorMessage: (error as Error).message,
+                    errorStack: (error as Error).stack,
+                    error: error
+                });
+                
                 return createJsonResponse({
-                    error: { message: (error as Error).message, type: "server_error", code: 500 }
+                    error: { 
+                        message: (error as Error).message, 
+                        type: "server_error", 
+                        code: 500,
+                        details: process.env.NODE_ENV === 'development' ? (error as Error).stack : undefined
+                    }
                 }, 500);
             }
         }
@@ -277,4 +376,18 @@ const server = Bun.serve({
     },
 });
 
-log('INFO', `Server started on port ${server.port}`);
+log('INFO', `Server started on port ${CONFIG.port}`, {
+    port: CONFIG.port,
+    apiKeySet: !!CONFIG.apiKey && CONFIG.apiKey !== 'default-key-change-me',
+    upstreamUrl: CONFIG.upstreamUrl,
+    excludedModelKeywords: EXCLUDED_MODEL_KEYWORDS,
+    cacheTTL: CACHE_TTL
+});
+
+// Log available routes at startup
+log('INFO', 'Available endpoints:', {
+    health: '/health',
+    models: '/v1/models',
+    chat: '/v1/chat/completions',
+    documentation: 'Provides DeepInfra API compatibility with text-only models'
+});
