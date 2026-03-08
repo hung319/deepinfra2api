@@ -1,6 +1,6 @@
 # DeepInfra No-Auth Proxy
 
-This is a proxy server that provides access to DeepInfra's API without requiring an API key. The service bypasses DeepInfra's authentication requirement by routing requests in a way that allows access to text-based models.
+This is a proxy server that provides access to DeepInfra's API without requiring an API key. The service attempts to bypass DeepInfra's authentication requirement by routing requests in a way that allows access to text-based models.
 
 ## Features
 
@@ -8,6 +8,7 @@ This is a proxy server that provides access to DeepInfra's API without requiring
 - **Text Model Filtering**: Automatically filters out non-text models (image generators, OCR models, etc.)
 - **Caching**: Implements model response caching to improve performance
 - **Logging**: Comprehensive logging for debugging and monitoring
+- **Proxy Support**: Attempts to route requests through external proxies to bypass auth
 
 ## Endpoints
 
@@ -26,9 +27,21 @@ Environment variables:
 2. Set environment variables
 3. Run: `bun index.ts`
 
-## Authentication
+## Authentication Bypass Approach
 
-Authentication has been disabled - all requests to the proxy are allowed. The proxy communicates with DeepInfra without requiring an API key.
+Authentication has been disabled on the proxy side - all requests to the proxy are allowed. The proxy attempts to communicate with DeepInfra without requiring an API key by:
+
+1. Removing authorization headers in requests to DeepInfra
+2. Attempting to route requests through proxies from ProxyScrape to vary source IP
+3. Adding headers to try to bypass authentication checks
+4. Using techniques similar to the deepinfra-wrapper project
+
+## Known Limitations
+
+- True proxy routing requires HTTP proxy support, which Bun doesn't have built-in
+- If DeepInfra has implemented strict authentication measures, bypass may not work
+- Success depends on whether DeepInfra requires authentication for all requests
+- This is a workaround approach and may stop working if DeepInfra changes their API
 
 ## Model Filtering
 
