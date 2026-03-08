@@ -244,7 +244,7 @@ const CORS_HEADERS = {
 
 // Upstream Headers Strategy
 function getUpstreamHeaders(): Headers {
-    return new Headers({
+    const headers = new Headers({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
         "Accept": "application/json",
         "Accept-Encoding": "gzip, deflate, br, zstd",
@@ -259,6 +259,10 @@ function getUpstreamHeaders(): Headers {
         "Sec-Fetch-Dest": "empty",
         "Referer": "https://deepinfra.com/"
     });
+    
+    // Don't include any authorization header to try to bypass auth requirement
+    // This is key to working without an API key
+    return headers;
 }
 
 // Helper: JSON Response with CORS
