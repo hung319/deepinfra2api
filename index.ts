@@ -34,12 +34,39 @@ interface ChatCompletionRequest {
     [key: string]: any; 
 }
 
-// Load configuration
+// Proxy management system
+let workingProxies: string[] = [];
+let proxyIndex: number = 0;
+
+// Configuration
 const CONFIG = {
     port: parseInt(process.env.PORT || '12506'),
-    apiKey: process.env.API_KEY || 'default-key-change-me',
-    upstreamUrl: "https://api.deepinfra.com/v1/openai"
+    upstreamUrl: "https://api.deepinfra.com/v1/openai",
+    proxyListUrl: "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&proxy_format=ipport&format=text&anonymity=Elite,Anonymous&timeout=5000"
 };
+
+// Update working proxies periodically
+// Note: This is a placeholder implementation. In a production environment,
+// you would need to implement actual proxy routing via HTTP agents, which requires
+// additional Bun-compatible HTTP proxy libraries or external proxy routing mechanisms.
+async function updateWorkingProxies() {
+    try {
+        log('INFO', 'Proxy system not fully implemented in this version - direct requests to DeepInfra will be made');
+        // In a real implementation, we would fetch and test proxies here
+        // For now, this is a placeholder to match the architecture of deepinfra-wrapper
+    } catch (error) {
+        log('ERROR', 'Error in proxy update function', { error: (error as Error).message });
+    }
+}
+
+// Get the next working proxy in rotation
+// In this version, we return null to indicate no proxy is being used
+function getNextWorkingProxy(): string | null {
+    return null; // No proxy in current implementation
+}
+
+// Initialize proxy list
+updateWorkingProxies();
 
 // FILTER CONFIGURATION: Keywords to exclude non-text models
 // Removes: Image generators, Image editors, specialized OCR, and CLIP embeddings
@@ -82,13 +109,7 @@ const CORS_HEADERS = {
 
 // Upstream Headers Strategy
 function getUpstreamHeaders(): Headers {
-    // Log a warning if using the default key
-    if (CONFIG.apiKey === 'default-key-change-me') {
-        log('ERROR', 'WARNING: Using default API key for upstream requests. This will result in 401 Unauthorized from DeepInfra API. Please set API_KEY environment variable with a valid DeepInfra API key.');
-    }
-    
     return new Headers({
-        "Authorization": `Bearer ${CONFIG.apiKey}`,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
         "Accept": "application/json",
         "Accept-Encoding": "gzip, deflate, br, zstd",
@@ -116,18 +137,10 @@ function createJsonResponse<T>(data: T, status = 200) {
     });
 }
 
-// Helper: API Key Validation
+// Helper: API Key Validation - no authentication required
 function validateApiKey(authHeader: string): boolean {
-    if (!authHeader.startsWith('Bearer ')) return false;
-    const token = authHeader.slice(7);
-    
-    // Check if using default key and log a warning
-    if (CONFIG.apiKey === 'default-key-change-me') {
-        log('ERROR', 'Using default API key - requests to upstream API will fail. Please set API_KEY environment variable with a valid DeepInfra API key.');
-        return token === CONFIG.apiKey; // This will pass validation but upstream will fail
-    }
-    
-    return token === CONFIG.apiKey;
+    // Always return true to allow all requests without API key
+    return true;
 }
 
 // CORE: Fetch and FILTER models
@@ -288,18 +301,22 @@ const server = Bun.serve({
                 accept: request.headers.get('Accept')
             });
             
-            const authHeader = request.headers.get("Authorization");
-            if (!authHeader) {
-                log('ERROR', 'Missing Authorization header in chat request');
-                return createJsonResponse({ error: { message: "Missing Authorization header", type: "authentication_error", code: 401 } }, 401);
-            }
+            // Note: Authentication has been disabled - all requests are allowed
+            // Original code:
+            // const authHeader = request.headers.get("Authorization");
+            // if (!authHeader) {
+            //     log('ERROR', 'Missing Authorization header in chat request');
+            //     return createJsonResponse({ error: { message: "Missing Authorization header", type: "authentication_error", code: 401 } }, 401);
+            // }
 
-            if (!validateApiKey(authHeader)) {
-                log('ERROR', 'Invalid API key provided in chat request');
-                return createJsonResponse({ error: { message: "Invalid API key", type: "authentication_error", code: 401 } }, 401);
-            }
+            // if (!validateApiKey(authHeader)) {
+            //     log('ERROR', 'Invalid API key provided in chat request');
+            //     return createJsonResponse({ error: { message: "Invalid API key", type: "authentication_error", code: 401 } }, 401);
+            // }
             
-            log('INFO', `API key validation passed for chat request`);
+            // log('INFO', `API key validation passed for chat request`);
+            
+            log('INFO', `Authentication bypassed - allowing request without API key`);
 
             try {
                 const body = await request.json() as ChatCompletionRequest;
@@ -391,7 +408,7 @@ const server = Bun.serve({
 
 log('INFO', `Server started on port ${CONFIG.port}`, {
     port: CONFIG.port,
-    apiKeySet: !!CONFIG.apiKey && CONFIG.apiKey !== 'default-key-change-me',
+    authenticationRequired: false, // No API key required
     upstreamUrl: CONFIG.upstreamUrl,
     excludedModelKeywords: EXCLUDED_MODEL_KEYWORDS,
     cacheTTL: CACHE_TTL
